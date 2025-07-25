@@ -21,6 +21,7 @@
 #include "varint.h"
 #include "path.h"
 #include "index_map.h"
+#include "splitindex.h"
 
 #include "git2/odb.h"
 #include "git2/oid.h"
@@ -44,6 +45,7 @@ static const unsigned int INDEX_HEADER_SIG = 0x44495243;
 static const char INDEX_EXT_TREECACHE_SIG[] = {'T', 'R', 'E', 'E'};
 static const char INDEX_EXT_UNMERGED_SIG[] = {'R', 'E', 'U', 'C'};
 static const char INDEX_EXT_CONFLICT_NAME_SIG[] = {'N', 'A', 'M', 'E'};
+static const char INDEX_EXT_LINK_SIG[] = {'l', 'i', 'n', 'k'};
 
 #define INDEX_OWNER(idx) ((git_repository *)(GIT_REFCOUNT_OWNER(idx)))
 
@@ -474,6 +476,11 @@ static void index_free(git_index *index)
 	git_vector_dispose(&index->names);
 	git_vector_dispose(&index->reuc);
 	git_vector_dispose(&index->deleted);
+
+	if (index->splitindex) {
+		git_splitindex_free(index->splitindex);
+		git__free(index->splitindex);
+	}
 
 	git__free(index->index_file_path);
 
@@ -2705,10 +2712,25 @@ static int read_extension(size_t *read_len, git_index *index, size_t checksum_si
 		/* else, unsupported extension. We cannot parse this, but we can skip
 		 * it by returning `total_size */
 	} else {
-		/* we cannot handle non-ignorable extensions;
-		 * in fact they aren't even defined in the standard */
-		git_error_set(GIT_ERROR_INDEX, "unsupported mandatory extension: '%.4s'", dest.signature);
-		return -1;
+		/* Handle mandatory extensions */
+		if (memcmp(dest.signature, INDEX_EXT_LINK_SIG, 4) == 0) {
+			/* Split-index link extension */
+			if (!index->splitindex) {
+				index->splitindex = git__calloc(1, sizeof(git_splitindex));
+				if (!index->splitindex || git_splitindex_init(index->splitindex) < 0) {
+					git__free(index->splitindex);
+					index->splitindex = NULL;
+					return -1;
+				}
+			}
+			if (git_splitindex_read_link(index->splitindex, index->oid_type, buffer + 8, dest.extension_size) < 0)
+				return -1;
+		} else {
+			/* we cannot handle non-ignorable extensions;
+			 * in fact they aren't even defined in the standard */
+			git_error_set(GIT_ERROR_INDEX, "unsupported mandatory extension: '%.4s'", dest.signature);
+			return -1;
+		}
 	}
 
 	*read_len = total_size;
@@ -2823,6 +2845,12 @@ static int parse_index(git_index *index, const char *buffer, size_t buffer_size)
 	}
 
 	memcpy(index->checksum, checksum, checksum_size);
+
+	/* If this is a split-index, merge entries from shared index */
+	if (index->splitindex && index->splitindex->is_split) {
+		if ((error = git_splitindex_merge_entries(index, index->splitindex)) < 0)
+			goto done;
+	}
 
 #undef seek_forward
 
@@ -3194,6 +3222,29 @@ static int write_tree_extension(git_index *index, git_filebuf *file)
 	return error;
 }
 
+static int write_link_extension(git_index *index, git_filebuf *file)
+{
+	struct index_extension extension;
+	git_str buf = GIT_STR_INIT;
+	int error;
+
+	if (!index->splitindex || !index->splitindex->is_split)
+		return 0;
+
+	if ((error = git_splitindex_write_link(&buf, index->splitindex)) < 0)
+		return error;
+
+	memset(&extension, 0x0, sizeof(struct index_extension));
+	memcpy(&extension.signature, INDEX_EXT_LINK_SIG, 4);
+	extension.extension_size = (uint32_t)buf.size;
+
+	error = write_extension(file, &extension, &buf);
+
+	git_str_dispose(&buf);
+
+	return error;
+}
+
 static void clear_uptodate(git_index *index)
 {
 	git_index_entry *entry;
@@ -3239,6 +3290,10 @@ static int write_index(
 
 	/* write the tree cache extension */
 	if (index->tree != NULL && write_tree_extension(index, file) < 0)
+		return -1;
+
+	/* write the split-index link extension */
+	if (write_link_extension(index, file) < 0)
 		return -1;
 
 	/* write the rename conflict extension */

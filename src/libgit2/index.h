@@ -14,6 +14,7 @@
 #include "vector.h"
 #include "tree-cache.h"
 #include "index_map.h"
+#include "splitindex.h"
 #include "git2/odb.h"
 #include "git2/index.h"
 
@@ -57,6 +58,8 @@ struct git_index {
 	git_vector_cmp entries_search;
 	git_vector_cmp entries_search_path;
 	git_vector_cmp reuc_search;
+	
+	git_splitindex *splitindex; /* splitindex support */
 
 	unsigned int version;
 };
